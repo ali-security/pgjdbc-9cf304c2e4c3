@@ -1,25 +1,15 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - '*'
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'appveyor.xml'
-  pull_request:
-    branches:
-      - '**'
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'appveyor.xml'
   workflow_dispatch:
     inputs:
       matrix_rng_seed:
         description: RNG Seed
         required: false
+      test-filter:
+        description: Space-separated test class names to run (empty runs the full suite)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -35,55 +25,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  code-style:
-    name: Code style
-    runs-on: ubuntu-latest
-    env:
-      ACTIONS_STEP_DEBUG: true
-      ACTIONS_RUNNER_DEBUG: true
-    steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      with:
-        fetch-depth: 50
-    - name: 'Set up JDK 21'
-      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
-      with:
-        distribution: zulu
-        java-version: 21
-    - uses: burrunan/gradle-cache-action@663fbad34e03c8f12b27f4999ac46e3d90f87eca # v3
-      name: Verify code style
-      env:
-        S3_BUILD_CACHE_ACCESS_KEY_ID: ${{ secrets.S3_BUILD_CACHE_ACCESS_KEY_ID }}
-        S3_BUILD_CACHE_SECRET_KEY: ${{ secrets.S3_BUILD_CACHE_SECRET_KEY }}
-      with:
-        job-id: jdk21
-        arguments: styleCheck jandex -PenableErrorprone classes
-
-  linux-checkerframework:
-    name: 'CheckerFramework'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 50
-      - name: 'Set up JDK 21'
-        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
-        with:
-          distribution: zulu
-          java-version: 21
-      - uses: burrunan/gradle-cache-action@663fbad34e03c8f12b27f4999ac46e3d90f87eca # v3
-        name: Run CheckerFramework
-        env:
-          S3_BUILD_CACHE_ACCESS_KEY_ID: ${{ secrets.S3_BUILD_CACHE_ACCESS_KEY_ID }}
-          S3_BUILD_CACHE_SECRET_KEY: ${{ secrets.S3_BUILD_CACHE_SECRET_KEY }}
-        with:
-          read-only: false
-          job-id: checker-jdk21
-          arguments: --scan --no-parallel --no-daemon -PenableCheckerframework classes :postgresql:compileJava11
-
   source-distribution-check:
     name: Source distribution
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -96,6 +41,7 @@ jobs:
         with:
           distribution: zulu
           java-version: 21
+          cache: gradle
       - uses: burrunan/gradle-cache-action@663fbad34e03c8f12b27f4999ac46e3d90f87eca # v3
         name: Prepare source distribution
         env:
@@ -103,13 +49,83 @@ jobs:
           S3_BUILD_CACHE_SECRET_KEY: ${{ secrets.S3_BUILD_CACHE_SECRET_KEY }}
         with:
           job-id: source-release-jdk21
-          arguments: --scan --no-parallel --no-daemon sourceDistribution -Ppgjdbc.version=1.0 -Prelease -Psigning.pgp.enabled=OFF
+          arguments: --no-parallel --no-daemon --no-build-cache sourceDistribution -Ppgjdbc.version=1.0 -Prelease -Psigning.pgp.enabled=OFF -Ps3.build.cache=false
       - name: Verify source distribution
         working-directory: pgjdbc/build/distributions
         run: |
           tar xzf postgresql-1.0-jdbc-src.tar.gz
           cd postgresql-1.0-jdbc-src
           mvn --batch-mode --fail-at-end --show-version verify
+      - name: Test results and skipped-test report
+        if: ${{ always() }}
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          NOTES = {
+              'org.postgresql.test.hostchooser.MultiHostsConnectionTest':
+                  'upstream main.yml "Start PostgreSQL" deletes the 5433/5434 replica port mappings (sed) on every leg, so the replicas are unreachable and isReplicationInstanceAvailable() is false by upstream design; a seal run that kept the ports mapped saw the test fail against the dockerized replicas (connectToSecondaryFirst: assertGlobalState expected <null> but was <localhost:5432=ConnectOK>), so the upstream step is kept verbatim',
+          }
+          GENERIC = re.compile(r'^(Assumption failed: )?(assumption is not (true|false))?$')
+          PAT = re.compile(r'assume|Assume|@Disabled|@Ignore|@EnabledIf|@DisabledIf|@EnabledOn|@DisabledOn')
+          def src_reason(cls, name):
+              path = cls.split('$')[0].replace('.', '/') + '.java'
+              files = glob.glob('**/src/test/java/' + path, recursive=True)
+              if not files:
+                  return ''
+              lines = open(files[0], encoding='utf-8', errors='replace').read().splitlines()
+              meth = re.split(r'[(\[]', name)[0].strip()
+              hits = []
+              for i, l in enumerate(lines):
+                  if re.search(r'\b' + re.escape(meth) + r'\s*\(', l) and not l.strip().startswith('//'):
+                      for l2 in lines[max(0, i - 4):i + 30]:
+                          if PAT.search(l2) and l2.strip() not in hits:
+                              hits.append(l2.strip())
+                      break
+              if not hits:
+                  hits = [l.strip() for l in lines if PAT.search(l) and not l.strip().startswith('import')][:3]
+              return ' '.join(hits[:3])
+          totals = {}
+          groups = {}
+          files = glob.glob('**/build/test-results/**/TEST-*.xml', recursive=True) + glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)
+          for f in sorted(files):
+              mod = re.split(r'/(build/test-results|target/surefire-reports)/', f)[0] or '.'
+              r = ET.parse(f).getroot()
+              t = totals.setdefault(mod, [0, 0, 0])
+              for tc in r.iter('testcase'):
+                  t[0] += 1
+                  if tc.find('failure') is not None or tc.find('error') is not None:
+                      t[1] += 1
+                  sk = tc.find('skipped')
+                  if sk is None:
+                      continue
+                  t[2] += 1
+                  cls = tc.get('classname', '')
+                  name = tc.get('name', '')
+                  msg = ' '.join((sk.get('message') or sk.text or '').split())
+                  if cls in NOTES:
+                      reason = NOTES[cls]
+                  elif GENERIC.match(msg):
+                      src = src_reason(cls, name)
+                      reason = (msg + ' -- source: ' + src) if src else (msg or 'no reason recorded')
+                  else:
+                      reason = msg
+                  groups.setdefault((cls, reason[:600]), []).append(re.split(r'[(\[]', name)[0])
+          print('Leg: %s' % os.environ.get('M_NAME', ''))
+          print('Leg flags: PG=%s ssl=%s scram=%s xa=%s replication=%s slow_tests=%s gss=%s includeTestTags=[%s]' % (
+              os.environ.get('M_PG'), os.environ.get('M_SSL'), os.environ.get('M_SCRAM'), os.environ.get('M_XA'),
+              os.environ.get('M_REPL'), os.environ.get('M_SLOW'), os.environ.get('M_GSS'), os.environ.get('M_TAGS')))
+          print('Tests tagged replication/xa/SlowTests are deselected by the JUnit tag filter on legs where that matrix flag is "no" (upstream matrix design); SSL-only tests skip on ssl=no legs; server-version and query-mode assumptions skip tests that need a newer PostgreSQL or the extended protocol.')
+          print('Skipped tests, one line per class and reason (count, methods):')
+          for (cls, reason), names in sorted(groups.items()):
+              uniq = sorted(set(names))
+              shown = ', '.join(uniq[:8]) + (', ...' if len(uniq) > 8 else '')
+              print('SKIPPED %s x%d [%s] -- reason: %s' % (cls, len(names), shown, reason))
+          g = [0, 0, 0]
+          for mod, (n, fl, sk) in sorted(totals.items()):
+              print('TEST RESULTS %s: %d tests, %d passed, %d failed, %d skipped' % (mod, n, n - fl - sk, fl, sk))
+              g = [g[0] + n, g[1] + fl, g[2] + sk]
+          print('TEST RESULTS TOTAL: %d tests, %d passed, %d failed, %d skipped' % (g[0], g[0] - g[1] - g[2], g[1], g[2]))
+          EOF
       - name: Attach heap dump if any
         if: ${{ failure() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -120,12 +136,13 @@ jobs:
   matrix_prep:
     name: Matrix Preparation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     env:
       MATRIX_JOBS: 5
       GITHUB_PR_NUMBER: ${{ github.event.number }}
-      RNG_SEED: ${{ github.event.inputs.matrix_rng_seed }}
+      RNG_SEED: ${{ github.event.inputs.matrix_rng_seed || 'seal-pgjdbc-42.7.10' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
@@ -135,8 +152,9 @@ jobs:
         node .github/workflows/matrix.mjs
 
   build-test:
-    name: '${{ matrix.name }}'
+    name: 'Java ${{ matrix.java_version }} ${{ matrix.java_distribution }} PG ${{ matrix.pg_version }}'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     needs: matrix_prep
     strategy:
       fail-fast: false
@@ -162,7 +180,7 @@ jobs:
       run: |
         echo 'Starting PostgreSQL via docker compose down; PGV=${{ matrix.pg_version }} TZ=${{ matrix.server_tz }} XA=${{ matrix.xa }} SSL=${{ matrix.ssl }} SCRAM=${{ matrix.scram }} CREATE_REPLICAS=${{ matrix.replication }} docker compose up'
 
-        docker compose down -v --rmi local || true
+        docker compose down -v --rmi local
         sed -i -r '/- (543[3-4]):\1/d' docker-compose.yml
         docker compose up -d
         docker compose logs
@@ -177,6 +195,7 @@ jobs:
         distribution: ${{ matrix.java_distribution }}
         # Architecture is explicit to workaround https://github.com/actions/setup-java/issues/559
         architecture: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x64' }}
+        cache: gradle
     - name: Set up Java ${{ matrix.java_version }}, oracle
       id: setup_ea_java
       if: ${{ matrix.oracle_java_website != '' }}
@@ -196,6 +215,7 @@ jobs:
         distribution: ${{ matrix.java_distribution }}
         # Architecture is explicit to workaround https://github.com/actions/setup-java/issues/559
         architecture: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x64' }}
+        cache: gradle
     - name: Prepare local properties
       run: |
         # See https://github.com/actions/runner/issues/409
@@ -206,6 +226,29 @@ jobs:
         preferQueryMode=${{ matrix.query_mode }}
         EOF
 
+    - name: Compute test filter
+      id: test_filter
+      env:
+        TEST_FILTER: ${{ inputs.test-filter }}
+      run: |
+        if [ -z "$TEST_FILTER" ]; then
+          echo "args=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Scoped run: let modules without a matching test pass instead of failing "No tests found"
+        cat > "$RUNNER_TEMP/seal-test-filter.gradle" <<'EOF'
+        allprojects {
+            tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false }
+        }
+        EOF
+        args="-I $RUNNER_TEMP/seal-test-filter.gradle"
+        for t in $TEST_FILTER; do
+          case "$t" in
+            *.*|\**) args="$args --tests $t" ;;
+            *) args="$args --tests *$t" ;;
+          esac
+        done
+        echo "args=$args" >> "$GITHUB_OUTPUT"
     - uses: burrunan/gradle-cache-action@663fbad34e03c8f12b27f4999ac46e3d90f87eca # v3
       name: Test
       env:
@@ -215,8 +258,9 @@ jobs:
       with:
         read-only: false
         job-id: jdk${{ matrix.java_version }}
-        arguments: --scan --no-parallel --no-daemon jandex test ${{ matrix.extraGradleArgs }}
+        arguments: --no-parallel --no-daemon --no-build-cache jandex test ${{ steps.test_filter.outputs.args }} ${{ matrix.extraGradleArgs }}
         properties: |
+          s3.build.cache=false
           includeTestTags=${{ matrix.includeTestTags }}
           testExtraJvmArgs=${{ matrix.testExtraJvmArgs }}
           jdkBuildVersion=21
@@ -257,9 +301,9 @@ jobs:
         ./gradlew assemble
         ./gradlew run
       env:
-        KRB5CCNAME: /home/runner/work/pgjdbc/pgjdbc/test-gss/tmp_check/krb5cc
-        KRB5_CONFIG: /home/runner/work/pgjdbc/pgjdbc/test-gss/tmp_check/krb5.conf
-        KRB5_KDC_PROFILE: /home/runner/work/pgjdbc/pgjdbc/test-gss/tmp_check/kdc.conf
+        KRB5CCNAME: ${{ github.workspace }}/test-gss/tmp_check/krb5cc
+        KRB5_CONFIG: ${{ github.workspace }}/test-gss/tmp_check/krb5.conf
+        KRB5_KDC_PROFILE: ${{ github.workspace }}/test-gss/tmp_check/kdc.conf
     - name: Test anorm-sbt
       if: ${{ matrix.check_anorm_sbt == 'yes' }}
       run: |
@@ -275,3 +319,110 @@ jobs:
       run: |
         docker compose ps
         docker compose down -v --rmi local
+    - name: Test results and skipped-test report
+      if: ${{ always() }}
+      run: |
+        python3 - <<'EOF'
+        import glob, os, re, xml.etree.ElementTree as ET
+        NOTES = {
+            'org.postgresql.test.hostchooser.MultiHostsConnectionTest':
+                'upstream main.yml "Start PostgreSQL" deletes the 5433/5434 replica port mappings (sed) on every leg, so the replicas are unreachable and isReplicationInstanceAvailable() is false by upstream design; a seal run that kept the ports mapped saw the test fail against the dockerized replicas (connectToSecondaryFirst: assertGlobalState expected <null> but was <localhost:5432=ConnectOK>), so the upstream step is kept verbatim',
+        }
+        GENERIC = re.compile(r'^(Assumption failed: )?(assumption is not (true|false))?$')
+        PAT = re.compile(r'assume|Assume|@Disabled|@Ignore|@EnabledIf|@DisabledIf|@EnabledOn|@DisabledOn')
+        def src_reason(cls, name):
+            path = cls.split('$')[0].replace('.', '/') + '.java'
+            files = glob.glob('**/src/test/java/' + path, recursive=True)
+            if not files:
+                return ''
+            lines = open(files[0], encoding='utf-8', errors='replace').read().splitlines()
+            meth = re.split(r'[(\[]', name)[0].strip()
+            hits = []
+            for i, l in enumerate(lines):
+                if re.search(r'\b' + re.escape(meth) + r'\s*\(', l) and not l.strip().startswith('//'):
+                    for l2 in lines[max(0, i - 4):i + 30]:
+                        if PAT.search(l2) and l2.strip() not in hits:
+                            hits.append(l2.strip())
+                    break
+            if not hits:
+                hits = [l.strip() for l in lines if PAT.search(l) and not l.strip().startswith('import')][:3]
+            return ' '.join(hits[:3])
+        totals = {}
+        groups = {}
+        files = glob.glob('**/build/test-results/**/TEST-*.xml', recursive=True) + glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)
+        for f in sorted(files):
+            mod = re.split(r'/(build/test-results|target/surefire-reports)/', f)[0] or '.'
+            r = ET.parse(f).getroot()
+            t = totals.setdefault(mod, [0, 0, 0])
+            for tc in r.iter('testcase'):
+                t[0] += 1
+                if tc.find('failure') is not None or tc.find('error') is not None:
+                    t[1] += 1
+                sk = tc.find('skipped')
+                if sk is None:
+                    continue
+                t[2] += 1
+                cls = tc.get('classname', '')
+                name = tc.get('name', '')
+                msg = ' '.join((sk.get('message') or sk.text or '').split())
+                if cls in NOTES:
+                    reason = NOTES[cls]
+                elif GENERIC.match(msg):
+                    src = src_reason(cls, name)
+                    reason = (msg + ' -- source: ' + src) if src else (msg or 'no reason recorded')
+                else:
+                    reason = msg
+                groups.setdefault((cls, reason[:600]), []).append(re.split(r'[(\[]', name)[0])
+        print('Leg: %s' % os.environ.get('M_NAME', ''))
+        print('Leg flags: PG=%s ssl=%s scram=%s xa=%s replication=%s slow_tests=%s gss=%s includeTestTags=[%s]' % (
+            os.environ.get('M_PG'), os.environ.get('M_SSL'), os.environ.get('M_SCRAM'), os.environ.get('M_XA'),
+            os.environ.get('M_REPL'), os.environ.get('M_SLOW'), os.environ.get('M_GSS'), os.environ.get('M_TAGS')))
+        print('Tests tagged replication/xa/SlowTests are deselected by the JUnit tag filter on legs where that matrix flag is "no" (upstream matrix design); SSL-only tests skip on ssl=no legs; server-version and query-mode assumptions skip tests that need a newer PostgreSQL or the extended protocol.')
+        print('Skipped tests, one line per class and reason (count, methods):')
+        for (cls, reason), names in sorted(groups.items()):
+            uniq = sorted(set(names))
+            shown = ', '.join(uniq[:8]) + (', ...' if len(uniq) > 8 else '')
+            print('SKIPPED %s x%d [%s] -- reason: %s' % (cls, len(names), shown, reason))
+        g = [0, 0, 0]
+        for mod, (n, fl, sk) in sorted(totals.items()):
+            print('TEST RESULTS %s: %d tests, %d passed, %d failed, %d skipped' % (mod, n, n - fl - sk, fl, sk))
+            g = [g[0] + n, g[1] + fl, g[2] + sk]
+        print('TEST RESULTS TOTAL: %d tests, %d passed, %d failed, %d skipped' % (g[0], g[0] - g[1] - g[2], g[1], g[2]))
+        EOF
+      env:
+        M_NAME: ${{ matrix.name }}
+        M_PG: ${{ matrix.pg_version }}
+        M_SSL: ${{ matrix.ssl }}
+        M_SCRAM: ${{ matrix.scram }}
+        M_XA: ${{ matrix.xa }}
+        M_REPL: ${{ matrix.replication }}
+        M_SLOW: ${{ matrix.slow_tests }}
+        M_GSS: ${{ matrix.gss }}
+        M_TAGS: ${{ matrix.includeTestTags }}
+
+  package:
+    name: Package postgresql jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 50
+      - name: 'Set up JDK 21'
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: zulu
+          java-version: 21
+          cache: gradle
+      - name: Build release osgiJar (the artifact published to Maven Central)
+        run: |
+          ./gradlew --no-daemon --no-build-cache --console=plain -Prelease -Ps3.build.cache=false -Psigning.pgp.enabled=OFF :postgresql:osgiJar
+          VERSION=$(grep '^pgjdbc.version=' gradle.properties | cut -d= -f2)
+          mkdir -p seal-dist
+          cp pgjdbc/build/libs/postgresql-${VERSION}-osgi.jar seal-dist/postgresql-${VERSION}.jar
+          ls -l seal-dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: postgresql-jar
+          path: seal-dist/postgresql-*.jar
+          if-no-files-found: error

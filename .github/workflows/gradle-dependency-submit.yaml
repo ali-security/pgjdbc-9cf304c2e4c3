@@ -3,9 +3,7 @@ name: Dependency Submission
 # See https://github.com/gradle/actions/blob/768a17f3488dc3fe0155ff431553e1f53d57e22e/dependency-submission/README.md#the-dependency-submission-action
 # The action allows GitHub to alert about reported vulnerabilities in the project
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 # Declare default permissions as read-only.
 permissions: read-all

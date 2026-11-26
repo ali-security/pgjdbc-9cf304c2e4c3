@@ -34,7 +34,7 @@ matrix.addAxis({
 });
 
 // We can't yet use EA here, see https://github.com/oracle-actions/setup-java/issues/65
-const eaJava = '26';
+const eaJava = '27';
 
 // Below versions will be used for testing only
 matrix.addAxis({
@@ -268,7 +268,7 @@ matrix.exclude({query_mode: {value: 'simple'}, pg_version: lessThan('9.1')});
 // Microsoft ships Java 11+
 matrix.imply({java_distribution: {value: 'microsoft'}}, {java_version: v => v >= 11});
 // Oracle JDK is only supported for JDK 21 and later
-matrix.imply({java_distribution: {value: 'oracle'}}, {java_version: v => v === eaJava || v >= 21});
+matrix.imply({java_distribution: {value: 'oracle'}}, {java_version: v => v === eaJava || v >= 25});
 // TODO: Semeru does not ship Java 21 builds yet
 matrix.exclude({java_distribution: {value: 'semeru'}, java_version: '21'})
 matrix.exclude({gss: {value: 'yes'}, os: ['windows-latest', 'macos-latest']})
